@@ -1,147 +1,178 @@
 package net.ccbluex.liquidbounce.features.module.modules.bmw
 
 import net.ccbluex.liquidbounce.config.types.ToggleableConfigurable
-import net.ccbluex.liquidbounce.event.events.PacketEvent
-import net.ccbluex.liquidbounce.event.events.WorldChangeEvent
-import net.ccbluex.liquidbounce.event.handler
 import net.ccbluex.liquidbounce.event.tickHandler
 import net.ccbluex.liquidbounce.features.module.Category
 import net.ccbluex.liquidbounce.features.module.ClientModule
-import net.ccbluex.liquidbounce.features.module.modules.world.scaffold.ModuleScaffold
 import net.ccbluex.liquidbounce.utils.block.getBlock
-import net.ccbluex.liquidbounce.utils.combat.CombatManager
-import net.minecraft.network.packet.s2c.play.PlayerPositionLookS2CPacket
 import net.minecraft.util.math.BlockPos
-import kotlin.math.ceil
+import net.minecraft.fluid.FlowableFluid
 import kotlin.math.floor
+import kotlinx.coroutines.*
 
 object ModuleAutoSave : ClientModule("AutoSave", Category.BMW) {
-
     private object AutoStuck : ToggleableConfigurable(ModuleAutoSave, "AutoStuck", true) {
         val stuckOnlyVoid by boolean("StuckOnlyVoid", true)
         val stuckFallDistance by int("StuckFallDistance", 5, 1..50, "blocks")
     }
 
     private object AutoScaffold : ToggleableConfigurable(ModuleAutoSave, "AutoScaffold", true) {
-        val scaffoldOnlyVoid by boolean("ScaffoldOnlyVoid", true)
-        val scaffoldVoidDistance by int("ScaffoldVoidDistance", 1, 1..50, "blocks")
-        val scaffoldOnlyDuringCombat by boolean("ScaffoldOnlyDuringCombat", true)
-    }
+    val scaffoldOnlyVoid by boolean("ScaffoldOnlyVoid", true)
+    val scaffoldVoidDistance by int("ScaffoldVoidDistance", 3, 1..50, "blocks")
+    val hitsUntilActivate by intRange("HitsUntilActivate", 0..1, 0..3)
+}
 
     init {
         tree(AutoStuck)
         tree(AutoScaffold)
     }
 
-    const val LOWEST_Y = -64
-    const val EDGE = 0.3
+    private const val LOWEST_Y = -64
+    private const val EDGE_THRESHOLD = 0.3
+    private const val SCAFFOLD_DELAY_MS = 50L
 
     private var lastGroundY = LOWEST_Y
     private var stuckSaving = false
     private var scaffoldSaving = false
+    private var receivedHits = 0
+    private var limitUntilActivate = AutoScaffold.hitsUntilActivate.random()
 
-    private fun reset(disable: Boolean) {
-        lastGroundY = LOWEST_Y
-        if (disable) {
-            if (stuckSaving) ModuleStuck.enabled = false
-            if (scaffoldSaving) ModuleScaffold.enabled = false
-        }
-        stuckSaving = false
-        scaffoldSaving = false
-    }
-
-    private fun aboveVoid(voidDistance: Int = -1): Boolean {
-        if (player.isOnGround) return false
-
-        var xMinOffset = 0
-        var xMaxOffset = 0
-        var zMinOffset = 0
-        var zMaxOffset = 0
-        if (player.x - floor(player.x) <= EDGE) {
-            xMinOffset = -1
-        }
-        if (ceil(player.x) - player.x <= EDGE) {
-            xMaxOffset = 1
-        }
-        if (player.z - floor(player.z) <= EDGE) {
-            zMinOffset = -1
-        }
-        if (ceil(player.z) - player.z <= EDGE) {
-            zMaxOffset = 1
-        }
-
-        for (xOffset in xMinOffset..xMaxOffset) {
-            for (zOffset in zMinOffset..zMaxOffset) {
-                for (y in
-                if (voidDistance == -1) LOWEST_Y..lastGroundY
-                else lastGroundY - voidDistance..lastGroundY
-                ) {
-                    val block = BlockPos(player.x.toInt() + xOffset, y, player.z.toInt() + zOffset).getBlock()
-                    block?.translationKey?.let {
-                        if (it != "block.minecraft.air") {
-                            return false
-                        }
-                    }
-                }
-            }
-        }
-
-        return true
-    }
-
-    @Suppress("unused")
-    private val worldChangeEventHandler = handler<WorldChangeEvent> {
-        reset(true)
-    }
-
-    @Suppress("unused")
-    private val packetEventHandler = handler<PacketEvent> { event ->
-        if (event.packet is PlayerPositionLookS2CPacket) {
-            reset(true)
-        }
-    }
+    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     @Suppress("unused")
     private val tickHandler = tickHandler {
-        if (player.isOnGround) {
-            lastGroundY = player.y.toInt() - 1
-        }
-
-        if (AutoStuck.enabled) {
-            if ((!AutoStuck.stuckOnlyVoid || aboveVoid()) && !player.isOnGround && player.y <= lastGroundY + 1 - AutoStuck.stuckFallDistance) {
-                if (!stuckSaving && !ModuleStuck.enabled) {
-                    ModuleStuck.enabled = true
-                    stuckSaving = true
-                }
-            } else {
-                if (stuckSaving) {
-                    stuckSaving = false
-                }
-            }
-        }
-
-        if (AutoScaffold.enabled) {
-            if ((!AutoScaffold.scaffoldOnlyDuringCombat || CombatManager.isInCombat)
-                && aboveVoid(
-                    if (AutoScaffold.scaffoldOnlyVoid) -1
-                    else AutoScaffold.scaffoldVoidDistance
-                )
-            ) {
-                if (!scaffoldSaving && !ModuleScaffold.enabled) {
-                    ModuleScaffold.enabled = true
-                    scaffoldSaving = true
-                }
-            } else {
-                if (scaffoldSaving) {
-                    ModuleScaffold.enabled = false
-                    scaffoldSaving = false
-                }
-            }
+        when {
+            player.isOnGround -> updateGroundPosition()
+            AutoStuck.enabled -> handleStuckProtection()
+            AutoScaffold.enabled -> handleScaffold()
         }
     }
 
-    override fun enable() {
-        reset(false)
+    private fun updateGroundPosition() {
+        lastGroundY = player.blockY - 1
+        if (scaffoldSaving) {
+            deactivateScaffold()
+        }
     }
+
+    private fun handleStuckProtection() {
+        val shouldTrigger = (!AutoStuck.stuckOnlyVoid || checkVoidPresence()) &&
+                player.y <= lastGroundY + 1 - AutoStuck.stuckFallDistance
+
+        when {
+            shouldTrigger && !stuckSaving -> activateStuckProtection()
+            !shouldTrigger && stuckSaving -> deactivateStuckProtection()
+        }
+    }
+
+    private fun handleScaffold() {
+        if (player.hurtTime in 1..9) receivedHits++
+
+        val voidCheckParam = if (AutoScaffold.scaffoldOnlyVoid) -1 else AutoScaffold.scaffoldVoidDistance
+        val currentInVoid = checkVoidPresence(voidCheckParam)
+        val shouldActivate = receivedHits >= limitUntilActivate && currentInVoid
+
+        when {
+            shouldActivate && !scaffoldSaving -> activateScaffold()
+            (!shouldActivate || !currentInVoid) && scaffoldSaving -> deactivateScaffold()
+        }
+    }
+
+    private fun checkVoidPresence(voidDistance: Int = -1): Boolean {
+        if (player.isOnGround || player.abilities.flying || player.y < LOWEST_Y + 2) return false
+
+        val (x, y, z) = player.pos.run { Triple(x, y, z) }
+        val minY = if (voidDistance == -1) LOWEST_Y else (y - voidDistance).toInt()
+        val maxY = player.blockY - 1
+
+        if (maxY < minY) return true
+
+        val xFloor = floor(x)
+        val zFloor = floor(z)
+        val xRem = x - xFloor
+        val zRem = z - zFloor
+
+
+        if (checkColumn(xFloor.toInt(), zFloor.toInt(), minY, maxY)) return true
+
+        if (xRem <= EDGE_THRESHOLD && checkColumn(xFloor.toInt() - 1, zFloor.toInt(), minY, maxY)) return true
+        if ((1 - xRem) <= EDGE_THRESHOLD && checkColumn(xFloor.toInt() + 1, zFloor.toInt(), minY, maxY)) return true
+        if (zRem <= EDGE_THRESHOLD && checkColumn(xFloor.toInt(), zFloor.toInt() - 1, minY, maxY)) return true
+        if ((1 - zRem) <= EDGE_THRESHOLD && checkColumn(xFloor.toInt(), zFloor.toInt() + 1, minY, maxY)) return true
+
+        if (xRem <= EDGE_THRESHOLD && zRem <= EDGE_THRESHOLD &&
+            checkColumn(xFloor.toInt() - 1, zFloor.toInt() - 1, minY, maxY)) return true
+        if ((1 - xRem) <= EDGE_THRESHOLD && (1 - zRem) <= EDGE_THRESHOLD &&
+            checkColumn(xFloor.toInt() + 1, zFloor.toInt() + 1, minY, maxY)) return true
+        if (xRem <= EDGE_THRESHOLD && (1 - zRem) <= EDGE_THRESHOLD &&
+            checkColumn(xFloor.toInt() - 1, zFloor.toInt() + 1, minY, maxY)) return true
+        if ((1 - xRem) <= EDGE_THRESHOLD && zRem <= EDGE_THRESHOLD &&
+            checkColumn(xFloor.toInt() + 1, zFloor.toInt() - 1, minY, maxY)) return true
+
+        return false
+    }
+
+    private fun checkColumn(x: Int, z: Int, minY: Int, maxY: Int): Boolean {
+        for (y in maxY downTo minY) {
+            BlockPos(x, y, z).getBlock()?.let { block ->
+                if (block.defaultState.blocksMovement() || block is FlowableFluid) {
+                    return false
+                }
+            } ?: break
+        }
+        return true
+    }
+
+    private fun activateStuckProtection() {
+        ModuleStuck.enabled = true
+        stuckSaving = true
+    }
+
+    private fun deactivateStuckProtection() {
+        ModuleStuck.enabled = false
+        stuckSaving = false
+    }
+
+private fun activateScaffold() {
+    ModuleClutch.enabled = true
+    scaffoldSaving = true
+    coroutineScope.launch {
+        delay(SCAFFOLD_DELAY_MS * 2)
+
+        if (scaffoldSaving && !checkVoidPresence(
+                if (AutoScaffold.scaffoldOnlyVoid) -1 else AutoScaffold.scaffoldVoidDistance
+            )) {
+            deactivateScaffold()
+        }
+
+        receivedHits = 0
+        limitUntilActivate = AutoScaffold.hitsUntilActivate.random()
+    }
+}
+
+private fun deactivateScaffold() {
+    if (scaffoldSaving) {
+        ModuleClutch.enabled = false
+        scaffoldSaving = false
+        receivedHits = 0
+        limitUntilActivate = AutoScaffold.hitsUntilActivate.random()
+    }
+}
+
+    override fun disable() {
+    coroutineScope.cancel()
+    resetState(true)
+    super.disable()
+}
+
+private fun resetState(disableModules: Boolean) {
+    lastGroundY = LOWEST_Y
+    if (disableModules) {
+        ModuleStuck.takeIf { stuckSaving }?.enabled = false
+        ModuleClutch.takeIf { scaffoldSaving }?.enabled = false
+    }
+    stuckSaving = false
+    scaffoldSaving = false
+}
 
 }
